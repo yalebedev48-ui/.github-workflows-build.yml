@@ -1,0 +1,546 @@
+name: Build margy.pet.mcmod
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: narezy/MargyC
+          path: margyc
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write mod sources
+        run: |
+          mkdir -p mod/src/com/you/margypet
+          cat > mod/manifest.json <<'EOF_MANIFEST'
+          {
+            "id": "margy.pet",
+            "name": "Margy Pet+",
+            "description": "Тамагочи-помощник, анимация логотипа, свои фоны и тёмная/светлая/AMOLED темы.",
+            "author": "you",
+            "version": "1.0",
+            "api": 1,
+            "entry": "com.you.margypet.PetMod",
+            "settings": [
+              {"key": "pet_on", "type": "toggle", "title": "Мини-помощник (тамагочи)", "description": "Тап — погладить, удержание — покормить, перетаскивание — переместить.", "default": true},
+              {"key": "pet_name", "type": "text", "title": "Имя питомца", "hint": "Margy", "default": "Margy"},
+              {"key": "pet_kind", "type": "choice", "title": "Вид питомца", "options": ["cat", "blob", "bot"], "default": "cat"},
+              {"key": "pet_size", "type": "number", "title": "Размер питомца (dp)", "default": 64},
+
+              {"key": "icon_anim", "type": "toggle", "title": "Анимация при нажатии на логотип", "default": true},
+              {"key": "icon_x", "type": "number", "title": "Логотип: позиция X (% ширины)", "default": 50},
+              {"key": "icon_y", "type": "number", "title": "Логотип: позиция Y (% высоты)", "default": 30},
+              {"key": "icon_r", "type": "number", "title": "Логотип: радиус зоны (dp)", "default": 40},
+              {"key": "show_zone", "type": "toggle", "title": "Показать зону нажатия (для настройки)", "default": false},
+
+              {"key": "theme", "type": "choice", "title": "Тема", "options": ["off", "dark", "light", "amoled"], "default": "off"},
+              {"key": "base_theme", "type": "choice", "title": "Какая тема сейчас в самом Claude", "options": ["auto", "light", "dark"], "default": "auto"},
+
+              {"key": "bg_on", "type": "toggle", "title": "Свой фон", "default": false},
+              {"key": "bg_list", "type": "multiline", "title": "Фото: ссылки http(s) или пути, по одному в строке", "default": ""},
+              {"key": "bg_mode", "type": "choice", "title": "Какое фото брать при запуске", "options": ["random", "cycle"], "default": "random"},
+              {"key": "bg_dim", "type": "number", "title": "Затемнение фона (%)", "default": 25},
+              {"key": "bg_alpha", "type": "number", "title": "Непрозрачность панелей поверх фото (%)", "default": 70}
+            ]
+          }
+          EOF_MANIFEST
+          cat > mod/src/com/you/margypet/PetMod.java <<'EOF_JAVA'
+          package com.you.margypet;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.content.res.Configuration;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PorterDuff;
+          import android.graphics.drawable.BitmapDrawable;
+          import android.os.Bundle;
+          import android.util.DisplayMetrics;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.animation.OvershootInterpolator;
+          import android.widget.FrameLayout;
+          import android.widget.Toast;
+          import cat.narezany.mods.api.MargyCPlugin;
+          import cat.narezany.mods.api.PluginContext;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Random;
+
+          /** Margy Pet+: tamagotchi helper, logo tap animation, themes, custom background. */
+          public final class PetMod implements MargyCPlugin {
+              private static final String[] HAPPY = {"Мур!", "Ура, ты здесь!", "Ещё погладь :)", "Работаем вместе!"};
+
+              private PluginContext ctx;
+              private volatile Bitmap bg;
+              private boolean petOn, iconAnim, showZone;
+              private int zx, zy, zr, petSize, dim;
+              private String kind, name;
+
+              @Override
+              public void onCreate(PluginContext c) {
+                  ctx = c;
+                  petOn = c.getBoolean("pet_on");
+                  iconAnim = c.getBoolean("icon_anim");
+                  showZone = c.getBoolean("show_zone");
+                  zx = c.getInt("icon_x");
+                  zy = c.getInt("icon_y");
+                  zr = c.getInt("icon_r");
+                  petSize = Math.max(32, c.getInt("pet_size"));
+                  dim = Math.min(90, Math.max(0, c.getInt("bg_dim")));
+                  kind = c.getString("pet_kind");
+                  name = c.getString("pet_name");
+                  if (name == null || name.isEmpty()) name = "Margy";
+
+                  setupColors(c);
+                  if (c.getBoolean("bg_on")) loadBg();
+
+                  c.addActivityCallbacks(new Application.ActivityLifecycleCallbacks() {
+                      @Override public void onActivityResumed(Activity a) { attach(a); }
+                      @Override public void onActivityCreated(Activity a, Bundle b) { }
+                      @Override public void onActivityStarted(Activity a) { }
+                      @Override public void onActivityPaused(Activity a) { }
+                      @Override public void onActivityStopped(Activity a) { }
+                      @Override public void onActivitySaveInstanceState(Activity a, Bundle b) { }
+                      @Override public void onActivityDestroyed(Activity a) { }
+                  });
+              }
+
+              // ---------------------------------------------------------------- themes
+
+              private static List<String> items(PluginContext c) {
+                  List<String> out = new ArrayList<>();
+                  String s = c.getString("bg_list");
+                  if (s != null) for (String line : s.split("\n")) if (!line.trim().isEmpty()) out.add(line.trim());
+                  return out;
+              }
+
+              private void setupColors(PluginContext c) {
+                  final String theme = c.getString("theme"), base = c.getString("base_theme");
+                  boolean sysDark = (c.app().getResources().getConfiguration().uiMode
+                          & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+                  boolean appDark = "dark".equals(base) || ("auto".equals(base) && sysDark);
+                  final boolean amoled = "amoled".equals(theme);
+                  boolean wantDark = amoled || "dark".equals(theme);
+                  boolean wantLight = "light".equals(theme);
+                  final boolean flip = (wantDark && !appDark) || (wantLight && appDark);
+                  final boolean effDark = wantDark || (!wantLight && appDark);
+                  final int surf = c.getBoolean("bg_on") && !items(c).isEmpty()
+                          ? Math.min(100, Math.max(0, c.getInt("bg_alpha"))) : 100;
+                  if (!flip && !amoled && surf >= 100) return;
+                  c.addColorFilter(col -> recolor(col, flip, effDark, amoled, surf));
+              }
+
+              private static int clamp(int v) { return v < 0 ? 0 : Math.min(v, 255); }
+
+              /** Hot path: no allocations. Only near-gray colors (surfaces/text) are touched; accents stay. */
+              private static int recolor(int c, boolean flip, boolean effDark, boolean amoled, int surf) {
+                  int a = c >>> 24, r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                  int max = Math.max(r, Math.max(g, b)), min = Math.min(r, Math.min(g, b));
+                  if (max - min > 28) return c;
+                  int l = (max + min) / 2;
+                  if (flip) {
+                      int s = 255 - 2 * l;                 // invert lightness, keep the warm tint
+                      r = clamp(r + s); g = clamp(g + s); b = clamp(b + s);
+                      l = 255 - l;
+                  }
+                  if (amoled && l < 48) { r = 0; g = 0; b = 0; l = 0; }
+                  if (surf < 100 && ((effDark && l <= 44) || (!effDark && l >= 236))) a = a * surf / 100;
+                  return (a << 24) | (r << 16) | (g << 8) | b;
+              }
+
+              // ------------------------------------------------------------ background
+
+              private void loadBg() {
+                  final List<String> list = items(ctx);
+                  if (list.isEmpty()) return;
+                  SharedPreferences sp = ctx.prefs();
+                  int i;
+                  if ("cycle".equals(ctx.getString("bg_mode"))) {
+                      i = sp.getInt("bg_i", 0) % list.size();
+                      sp.edit().putInt("bg_i", i + 1).apply();
+                  } else {
+                      i = new Random().nextInt(list.size());
+                  }
+                  final String src = list.get(i);
+                  new Thread(() -> {
+                      try {
+                          File f = fileFor(src);
+                          Bitmap b = f == null ? null : decode(f);
+                          if (b == null) return;
+                          bg = b;
+                          final Activity cur = ctx.currentActivity();
+                          if (cur != null) cur.runOnUiThread(() -> applyBg(cur));
+                      } catch (Throwable t) {
+                          ctx.log("background: " + t);
+                      }
+                  }, "pet-bg").start();
+              }
+
+              private File fileFor(String s) throws Exception {
+                  if (!s.startsWith("http")) {
+                      File f = new File(s);
+                      if (!f.canRead()) ctx.log("background: cannot read " + s);
+                      return f.canRead() ? f : null;
+                  }
+                  File f = new File(ctx.app().getCacheDir(), "margypet_" + Integer.toHexString(s.hashCode()) + ".img");
+                  if (f.length() > 0) return f;
+                  File tmp = new File(f.getPath() + ".tmp");
+                  HttpURLConnection h = (HttpURLConnection) new URL(s).openConnection();
+                  h.setConnectTimeout(10000);
+                  h.setReadTimeout(20000);
+                  try (InputStream in = h.getInputStream(); OutputStream out = new FileOutputStream(tmp)) {
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                  }
+                  return tmp.renameTo(f) ? f : null;
+              }
+
+              /** Decodes near screen size and center-crops to the screen aspect so it fills the window. */
+              private Bitmap decode(File f) {
+                  DisplayMetrics dm = ctx.app().getResources().getDisplayMetrics();
+                  BitmapFactory.Options o = new BitmapFactory.Options();
+                  o.inJustDecodeBounds = true;
+                  BitmapFactory.decodeFile(f.getPath(), o);
+                  int s = 1;
+                  while (o.outWidth / (s * 2) >= dm.widthPixels && o.outHeight / (s * 2) >= dm.heightPixels) s *= 2;
+                  o.inJustDecodeBounds = false;
+                  o.inSampleSize = s;
+                  Bitmap b = BitmapFactory.decodeFile(f.getPath(), o);
+                  if (b == null) return null;
+                  float want = (float) dm.widthPixels / dm.heightPixels, have = (float) b.getWidth() / b.getHeight();
+                  int w = b.getWidth(), h = b.getHeight(), x = 0, y = 0;
+                  if (have > want) { w = Math.round(h * want); x = (b.getWidth() - w) / 2; }
+                  else { h = Math.round(w / want); y = (b.getHeight() - h) / 2; }
+                  return Bitmap.createBitmap(b, x, y, w, h);
+              }
+
+              private void applyBg(Activity a) {
+                  Bitmap b = bg;
+                  if (b == null) return;
+                  BitmapDrawable d = new BitmapDrawable(a.getResources(), b);
+                  d.setColorFilter(Color.argb(dim * 255 / 100, 0, 0, 0), PorterDuff.Mode.SRC_ATOP);
+                  a.getWindow().setBackgroundDrawable(d);
+              }
+
+              // --------------------------------------------------------------- overlay
+
+              private void attach(Activity a) {
+                  if (a.getClass().getName().startsWith("cat.narezany.mods.")) return;
+                  try {
+                      applyBg(a);
+                      ViewGroup decor = (ViewGroup) a.getWindow().getDecorView();
+                      for (int i = decor.getChildCount() - 1; i >= 0; i--) if (decor.getChildAt(i) instanceof Overlay) return;
+                      decor.addView(new Overlay(a), new FrameLayout.LayoutParams(-1, -1));
+                  } catch (Throwable t) {
+                      ctx.log("attach: " + t);
+                  }
+              }
+
+              /** Full-screen layer on top. Never swallows touches: the app below still gets them. */
+              private final class Overlay extends FrameLayout {
+                  private final Fx fx;
+
+                  Overlay(Context c) {
+                      super(c);
+                      fx = new Fx(c);
+                      addView(fx, new LayoutParams(-1, -1));
+                      if (petOn) addView(new Pet(c), new LayoutParams(-2, -2));
+                  }
+
+                  @Override
+                  public boolean dispatchTouchEvent(MotionEvent e) {
+                      boolean handled = super.dispatchTouchEvent(e);
+                      if (!handled && iconAnim && e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                          float cx = getWidth() * zx / 100f, cy = getHeight() * zy / 100f;
+                          float rad = zr * getResources().getDisplayMetrics().density;
+                          float dx = e.getX() - cx, dy = e.getY() - cy;
+                          if (dx * dx + dy * dy <= rad * rad) fx.burst(cx, cy, rad);
+                      }
+                      return handled;
+                  }
+              }
+
+              /** Logo animation: spinning starburst + ring + sparks over the tapped zone. */
+              private final class Fx extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final OvershootInterpolator over = new OvershootInterpolator(2f);
+                  private final List<float[]> parts = new ArrayList<>();
+                  private long t0;
+                  private float cx, cy, rad;
+                  private boolean on;
+
+                  Fx(Context c) { super(c); }
+
+                  void burst(float x, float y, float r) {
+                      cx = x; cy = y; rad = r; t0 = System.nanoTime(); on = true;
+                      parts.clear();
+                      Random rnd = new Random();
+                      for (int i = 0; i < 14; i++) {
+                          double an = i * 2 * Math.PI / 14 + rnd.nextDouble() * 0.3;
+                          parts.add(new float[]{(float) Math.cos(an), (float) Math.sin(an), r * (1.1f + rnd.nextFloat()), 3 + rnd.nextFloat() * 4});
+                      }
+                      postInvalidateOnAnimation();
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      float d = getResources().getDisplayMetrics().density;
+                      if (showZone) {
+                          p.setStyle(Paint.Style.STROKE);
+                          p.setStrokeWidth(2 * d);
+                          p.setColor(0x99FF00FF);
+                          c.drawCircle(getWidth() * zx / 100f, getHeight() * zy / 100f, zr * d, p);
+                      }
+                      if (!on) return;
+                      float t = (System.nanoTime() - t0) / 8e8f;
+                      if (t >= 1f) { on = false; return; }
+                      float e = 1f - (1f - t) * (1f - t) * (1f - t);
+                      float fade = t < 0.6f ? 1f : (1f - t) / 0.4f;
+
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeCap(Paint.Cap.ROUND);
+                      p.setStrokeWidth(3 * d);
+                      p.setColor(0xFFD97757);
+                      p.setAlpha((int) (180 * (1f - t)));
+                      c.drawCircle(cx, cy, rad * (0.5f + e), p);
+
+                      p.setStrokeWidth(rad * 0.2f);
+                      p.setColor(0xFFD97757);
+                      p.setAlpha((int) (255 * fade));
+                      float s = rad * 0.8f * (1f + 0.3f * (float) Math.sin(Math.PI * t));
+                      c.save();
+                      c.rotate(360f * over.getInterpolation(t), cx, cy);
+                      for (int i = 0; i < 8; i++) {
+                          c.drawLine(cx, cy - s * 0.25f, cx, cy - s, p);
+                          c.rotate(45f, cx, cy);
+                      }
+                      c.restore();
+
+                      p.setStyle(Paint.Style.FILL);
+                      for (float[] q : parts) {
+                          p.setColor(0xFFFFC27A);
+                          p.setAlpha((int) (255 * (1f - t)));
+                          c.drawCircle(cx + q[0] * q[2] * e, cy + q[1] * q[2] * e, q[3] * d * (1f - t), p);
+                      }
+                      postInvalidateOnAnimation();
+                  }
+              }
+
+              // ------------------------------------------------------------------- pet
+
+              private final class Pet extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path path = new Path();
+                  private final Random rnd = new Random();
+                  private final float d;
+                  private final int px;
+                  private float hunger, fun, sx, sy, ox, oy;
+                  private long lastTick, downAt, heartUntil;
+                  private boolean moved;
+
+                  Pet(Context c) {
+                      super(c);
+                      d = c.getResources().getDisplayMetrics().density;
+                      px = Math.round(petSize * d);
+                      SharedPreferences sp = ctx.prefs();
+                      long now = System.currentTimeMillis();
+                      float hrs = Math.min(12f, (now - sp.getLong("pet_t", now)) / 3.6e6f);
+                      hunger = Math.max(5f, sp.getFloat("pet_hunger", 80f) - 6f * hrs);
+                      fun = Math.max(5f, sp.getFloat("pet_fun", 80f) - 5f * hrs);
+                      lastTick = now;
+                  }
+
+                  @Override protected void onMeasure(int w, int h) { setMeasuredDimension(px, px); }
+
+                  @Override
+                  protected void onAttachedToWindow() {
+                      super.onAttachedToWindow();
+                      post(() -> {
+                          ViewGroup pp = (ViewGroup) getParent();
+                          if (pp == null) return;
+                          SharedPreferences sp = ctx.prefs();
+                          setX(sp.getFloat("pet_x", 0.9f) * Math.max(1, pp.getWidth() - px));
+                          setY(sp.getFloat("pet_y", 0.5f) * Math.max(1, pp.getHeight() - px));
+                      });
+                  }
+
+                  private void save() {
+                      ctx.prefs().edit().putFloat("pet_hunger", hunger).putFloat("pet_fun", fun)
+                              .putLong("pet_t", System.currentTimeMillis()).apply();
+                  }
+
+                  private void say(String msg) {
+                      Toast.makeText(getContext(), name + ": " + msg, Toast.LENGTH_SHORT).show();
+                  }
+
+                  private String stats() { return " (сытость " + (int) hunger + "%, настроение " + (int) fun + "%)"; }
+
+                  private void pat() {
+                      fun = Math.min(100f, fun + 12f);
+                      heartUntil = System.currentTimeMillis() + 1200;
+                      save();
+                      say((hunger < 25f ? "Я голоден… удержи меня, чтобы покормить." : HAPPY[rnd.nextInt(HAPPY.length)]) + stats());
+                  }
+
+                  private void feed() {
+                      hunger = Math.min(100f, hunger + 25f);
+                      fun = Math.min(100f, fun + 3f);
+                      heartUntil = System.currentTimeMillis() + 1200;
+                      save();
+                      say("Ням-ням!" + stats());
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent e) {
+                      ViewGroup pp = (ViewGroup) getParent();
+                      switch (e.getActionMasked()) {
+                          case MotionEvent.ACTION_DOWN:
+                              sx = e.getRawX(); sy = e.getRawY();
+                              ox = getX() - sx; oy = getY() - sy;
+                              moved = false;
+                              downAt = System.currentTimeMillis();
+                              break;
+                          case MotionEvent.ACTION_MOVE:
+                              if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 12 * d) moved = true;
+                              if (moved && pp != null) {
+                                  setX(Math.max(0, Math.min(pp.getWidth() - getWidth(), e.getRawX() + ox)));
+                                  setY(Math.max(0, Math.min(pp.getHeight() - getHeight(), e.getRawY() + oy)));
+                              }
+                              break;
+                          case MotionEvent.ACTION_UP:
+                              if (moved && pp != null) {
+                                  ctx.prefs().edit()
+                                          .putFloat("pet_x", getX() / Math.max(1, pp.getWidth() - getWidth()))
+                                          .putFloat("pet_y", getY() / Math.max(1, pp.getHeight() - getHeight()))
+                                          .apply();
+                              } else if (System.currentTimeMillis() - downAt > 500) feed();
+                              else pat();
+                              break;
+                          default:
+                              break;
+                      }
+                      return true;
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      long now = System.currentTimeMillis();
+                      float h = (now - lastTick) / 3.6e6f;
+                      lastTick = now;
+                      hunger = Math.max(5f, hunger - 6f * h);
+                      fun = Math.max(5f, fun - 5f * h);
+
+                      float w = getWidth(), cx = w / 2f, r = w * 0.34f;
+                      float cy = w * 0.58f + (float) Math.sin(now / 300.0) * w * 0.03f;
+                      boolean sad = hunger < 25f || fun < 25f, happy = hunger > 70f && fun > 70f;
+                      boolean cat = "cat".equals(kind), bot = "bot".equals(kind);
+
+                      p.setStyle(Paint.Style.FILL);
+                      p.setColor(cat ? 0xFFFFC27A : bot ? 0xFFA9B8FF : 0xFF86DDB0);
+                      if (cat) {
+                          for (int s = -1; s <= 1; s += 2) {
+                              path.reset();
+                              path.moveTo(cx + s * r * 0.9f, cy - r * 0.1f);
+                              path.lineTo(cx + s * r * 0.7f, cy - r * 1.3f);
+                              path.lineTo(cx + s * r * 0.1f, cy - r * 0.8f);
+                              path.close();
+                              c.drawPath(path, p);
+                          }
+                      }
+                      if (bot) c.drawRoundRect(cx - r, cy - r, cx + r, cy + r, r * 0.4f, r * 0.4f, p);
+                      else c.drawCircle(cx, cy, r, p);
+                      if (bot) {
+                          p.setStyle(Paint.Style.STROKE);
+                          p.setStrokeWidth(w * 0.03f);
+                          p.setColor(0xFF555555);
+                          c.drawLine(cx, cy - r, cx, cy - r * 1.35f, p);
+                          p.setStyle(Paint.Style.FILL);
+                          p.setColor(0xFFFF6B6B);
+                          c.drawCircle(cx, cy - r * 1.4f, w * 0.05f, p);
+                      }
+
+                      p.setColor(0xFF333333);
+                      boolean blink = now % 4000 < 130;
+                      float ey = cy - r * 0.1f + (sad ? r * 0.1f : 0f);
+                      if (blink || happy) {
+                          p.setStyle(Paint.Style.STROKE);
+                          p.setStrokeWidth(w * 0.035f);
+                          p.setStrokeCap(Paint.Cap.ROUND);
+                          for (int s = -1; s <= 1; s += 2) {
+                              float ex = cx + s * r * 0.4f;
+                              c.drawArc(ex - r * 0.15f, ey - r * 0.12f, ex + r * 0.15f, ey + r * 0.18f, 200, 140, false, p);
+                          }
+                      } else {
+                          p.setStyle(Paint.Style.FILL);
+                          c.drawCircle(cx - r * 0.4f, ey, r * 0.12f, p);
+                          c.drawCircle(cx + r * 0.4f, ey, r * 0.12f, p);
+                      }
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(w * 0.035f);
+                      p.setStrokeCap(Paint.Cap.ROUND);
+                      if (sad) c.drawArc(cx - r * 0.25f, cy + r * 0.4f, cx + r * 0.25f, cy + r * 0.75f, 200, 140, false, p);
+                      else c.drawArc(cx - r * 0.25f, cy + r * 0.1f, cx + r * 0.25f, cy + r * 0.5f, 20, 140, false, p);
+
+                      if (heartUntil > now) {
+                          float k = (heartUntil - now) / 1200f;
+                          p.setStyle(Paint.Style.FILL);
+                          p.setColor(0xFFFF4D6D);
+                          p.setAlpha((int) (255 * k));
+                          p.setTextSize(w * 0.3f);
+                          c.drawText("\u2665", cx + r * 0.5f, cy - r - (1f - k) * w * 0.25f, p);
+                      }
+                      postInvalidateDelayed(40);
+                  }
+              }
+          }
+          EOF_JAVA
+
+      - name: Build .mcmod
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          AJ="$SDK/platforms/android-35/android.jar"
+          D8="$SDK/build-tools/35.0.0/d8"
+          mkdir -p out/api out/mod out/dex
+          javac --release 8 -encoding UTF-8 -cp "$AJ" -d out/api $(find margyc/src/cat/narezany/mods/api -name '*.java')
+          javac --release 8 -encoding UTF-8 -cp "$AJ:out/api" -d out/mod $(find mod/src -name '*.java')
+          "$D8" --min-api 29 --lib "$AJ" --classpath out/api --output out/dex $(find out/mod -name '*.class')
+          cp mod/manifest.json out/dex/manifest.json
+          (cd out/dex && zip -q margy.pet.mcmod manifest.json classes.dex)
+          unzip -l out/dex/margy.pet.mcmod
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0-${{ github.run_number }}" out/dex/margy.pet.mcmod \
+            --repo "$GITHUB_REPOSITORY" --title "margy.pet.mcmod" --notes "Готовый мод: скачай файл margy.pet.mcmod"
